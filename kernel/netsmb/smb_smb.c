@@ -29,11 +29,12 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $Id: smb_smb.c,v 1.13 2002/05/03 17:45:28 lindak Exp $
+ * $Id: smb_smb.c,v 1.23 2003/09/06 20:27:15 lindak Exp $
  */
 /*
  * various SMB requests. Most of the routines merely packs data into mbufs.
  */
+#include <stdint.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -56,6 +57,7 @@
 #include <netsmb/smb_rq.h>
 #include <netsmb/smb_conn.h>
 #include <netsmb/smb_tran.h>
+#include <fs/smbfs/smbfs_subr.h>
 
 struct smb_dialect {
 	int		d_id;
@@ -105,7 +107,7 @@ smb_vc_maxwrite(struct smb_vc *vcp)
 static int
 smb_smb_nomux(struct smb_vc *vcp, struct smb_cred *scred, const char *name)
 {
-	if (scred->scr_p == vcp->vc_iod->iod_p)
+	if (scred == &vcp->vc_iod->iod_scred)
 		return 0;
 	SMBERROR("wrong function called(%s)\n", name);
 	return EINVAL;
@@ -138,8 +140,10 @@ smb_smb_negotiate(struct smb_vc *vcp, struct smb_cred *scred)
 		vcp->vc_tolocal  = NULL;
 	}
 #endif
-	vcp->vc_hflags = 0;
-	vcp->vc_hflags2 = 0;
+	vcp->vc_hflags = SMB_FLAGS_CASELESS;
+#ifndef XXX
+	vcp->vc_hflags2 |= SMB_FLAGS2_ERR_STATUS;
+#endif
 	vcp->obj.co_flags &= ~(SMBV_ENCRYPT);
 	sp = &vcp->vc_sopt;
 	bzero(sp, sizeof(struct smb_sopt));
@@ -167,15 +171,14 @@ smb_smb_negotiate(struct smb_vc *vcp, struct smb_cred *scred)
 		error = md_get_uint16le(mdp, &dindex);
 		if (error)
 			break;
+		error = EBADRPC;
 		if (dindex > 7) {
 			SMBERROR("Don't know how to talk with server %s (%d)\n", "xxx", dindex);
-			error = EBADRPC;
 			break;
 		}
 		dp = smb_dialects + dindex;
 		sp->sv_proto = dp->d_id;
 		SMBSDEBUG("Dialect %s (%d, %d)\n", dp->d_name, dindex, wc);
-		error = EBADRPC;
 		if (dp->d_id >= SMB_DIALECT_NTLM0_12) {
 			if (wc != 17)
 				break;
@@ -189,34 +192,65 @@ smb_smb_negotiate(struct smb_vc *vcp, struct smb_cred *scred)
 			md_get_mem(mdp, stime, 8, MB_MSYSTEM);
 			md_get_uint16le(mdp, (u_int16_t*)&sp->sv_tz);
 			md_get_uint8(mdp, &sblen);
-			if (sblen && (sp->sv_sm & SMB_SM_ENCRYPT)) {
-				if (sblen != SMB_MAXCHALLENGELEN) {
-					SMBERROR("Unexpected length of security blob (%d)\n", sblen);
-					break;
-				}
-				error = md_get_uint16(mdp, &bc);
-				if (error)
-					break;
-				if (sp->sv_caps & SMB_CAP_EXT_SECURITY)
-					md_get_mem(mdp, NULL, 16, MB_MSYSTEM);
-				error = md_get_mem(mdp, vcp->vc_ch, sblen, MB_MSYSTEM);
-				if (error)
-					break;
-				vcp->vc_chlen = sblen;
-				vcp->obj.co_flags |= SMBV_ENCRYPT;
-			}
+			error = md_get_uint16le(mdp, &bc);
+			if (error)
+				break;
 #ifdef APPLE
-			if (sp->sv_caps & SMB_CAP_UNICODE)
+			if (sp->sv_caps & SMB_CAP_UNICODE) {
+				/*
+				 * They do Unicode.
+				 */
 				vcp->obj.co_flags |= SMBV_UNICODE;
+			}
+			if (!(sp->sv_caps & SMB_CAP_STATUS32)) {
+				/*
+				 * They don't do NT error codes.
+				 *
+				 * If we send requests with
+				 * SMB_FLAGS2_ERR_STATUS set in
+				 * Flags2, Windows 98, at least
+				 * appears to send replies with that
+				 * bit set even though it sends back
+				 * DOS error codes.  (They probably
+				 * just use the request header as
+				 * a template for the reply header,
+				 * and don't bother clearing that bit.)
+				 *
+				 * Therefore, we clear that bit in
+				 * our vc_hflags2 field.
+				 */
+				vcp->vc_hflags2 &= ~SMB_FLAGS2_ERR_STATUS;
+			}
 #endif
-			vcp->vc_hflags2 |= SMB_FLAGS2_KNOWS_LONG_NAMES;
 			if (dp->d_id == SMB_DIALECT_NTLM0_12 &&
 			    sp->sv_maxtx < 4096 &&
 			    (sp->sv_caps & SMB_CAP_NT_SMBS) == 0) {
 				vcp->obj.co_flags |= SMBV_WIN95;
 				SMBSDEBUG("Win95 detected\n");
 			}
-		} else if (dp->d_id > SMB_DIALECT_CORE) {
+			if (sblen && sblen <= SMB_MAXCHALLENGELEN &&
+			    sp->sv_sm & SMB_SM_ENCRYPT) {
+				error = md_get_mem(mdp, vcp->vc_ch, sblen,
+						   MB_MSYSTEM);
+				if (error)
+					break;
+				vcp->vc_chlen = sblen;
+				vcp->obj.co_flags |= SMBV_ENCRYPT;
+				break;
+			}
+			if (!(sp->sv_caps & SMB_CAP_EXT_SECURITY))
+				break;
+			error = EBADRPC;
+			/* Warning: NetApp may omit the GUID */
+			vcp->vc_outtoklen =  bc;
+			vcp->vc_outtok = malloc(bc, M_SMBTEMP, M_WAITOK);
+			error = md_get_mem(mdp, vcp->vc_outtok, bc, MB_MSYSTEM);
+			break;
+		}
+		vcp->vc_hflags2 &= ~(SMB_FLAGS2_EXT_SEC|SMB_FLAGS2_DFS|
+				     SMB_FLAGS2_ERR_STATUS|SMB_FLAGS2_UNICODE);
+		unicode = 0;
+		if (dp->d_id > SMB_DIALECT_CORE) {
 			md_get_uint16le(mdp, &tw);
 			sp->sv_sm = tw;
 			md_get_uint16le(mdp, &tw);
@@ -233,7 +267,7 @@ smb_smb_negotiate(struct smb_vc *vcp, struct smb_cred *scred)
 				if (swlen > SMB_MAXCHALLENGELEN)
 					break;
 				md_get_uint16(mdp, NULL);	/* mbz */
-				if (md_get_uint16(mdp, &bc) != 0)
+				if (md_get_uint16le(mdp, &bc) != 0)
 					break;
 				if (bc < swlen)
 					break;
@@ -245,8 +279,8 @@ smb_smb_negotiate(struct smb_vc *vcp, struct smb_cred *scred)
 					vcp->obj.co_flags |= SMBV_ENCRYPT;
 				}
 			}
-			vcp->vc_hflags2 |= SMB_FLAGS2_KNOWS_LONG_NAMES;
 		} else {	/* an old CORE protocol */
+			vcp->vc_hflags2 &= ~SMB_FLAGS2_KNOWS_LONG_NAMES;
 			sp->sv_maxmux = 1;
 		}
 		error = 0;
@@ -292,30 +326,61 @@ smb_smb_ssnsetup(struct smb_vc *vcp, struct smb_cred *scred)
 {
 	struct smb_rq *rqp;
 	struct mbchain *mbp;
-/*	u_int8_t wc;
-	u_int16_t tw, tw1;*/
-	smb_uniptr unipp, ntencpass = NULL;
-	char *pp, *up, *pbuf, *encpass;
-	int error, plen, uniplen, ulen;
-#ifdef APPLE
+	struct mdchain *mdp;
+	u_int8_t wc;
+/*	u_int16_t tw, tw1;*/
+	smb_uniptr unipp = NULL, ntencpass = NULL;
+	char *pp = NULL, *up;
+	char *pbuf = NULL;
+	char *encpass = NULL;
+	int error, plen = 0, uniplen = 0, ulen;
 	int upper = 0;
+	u_int32_t caps = 0;
+	u_int16_t bl; /* BLOB length */
 
+#ifdef APPLE
+	caps |= SMB_CAP_LARGE_FILES;
+	if (vcp->obj.co_flags & SMBV_UNICODE)
+		caps |= SMB_CAP_UNICODE;
+#endif
+#ifdef XXX
+	caps |= SMB_CAP_NT_SMBS;
+#endif
+	if (vcp->vc_intok) {
+		if (vcp->vc_intoklen > 65536 ||
+		    !(vcp->vc_hflags2 & SMB_FLAGS2_EXT_SEC) ||
+		    SMB_DIALECT(vcp) < SMB_DIALECT_NTLM0_12)
+			return EINVAL;
+		vcp->vc_smbuid = 0;
+	}
+	if (vcp->vc_hflags2 & SMB_FLAGS2_ERR_STATUS)
+		caps |= SMB_CAP_STATUS32;
 again:
 
-#endif /* APPLE */
-
-	vcp->vc_smbuid = SMB_UID_UNKNOWN;
+	if (!vcp->vc_intok)
+		vcp->vc_smbuid = SMB_UID_UNKNOWN;
 
 	if (smb_smb_nomux(vcp, scred, __FUNCTION__) != 0)
 		return EINVAL;
 
-	error = smb_rq_alloc(VCTOCP(vcp), SMB_COM_SESSION_SETUP_ANDX, scred, &rqp);
+	error = smb_rq_alloc(VCTOCP(vcp), SMB_COM_SESSION_SETUP_ANDX,
+			     scred, &rqp);
 	if (error)
 		return error;
-	pbuf = malloc(SMB_MAXPASSWORDLEN + 1, M_SMBTEMP, M_WAITOK);
-	encpass = malloc(24, M_SMBTEMP, M_WAITOK);
-	if (vcp->vc_sopt.sv_sm & SMB_SM_USER) {
-#ifdef APPLE
+	if (vcp->vc_intok) {
+		caps |= SMB_CAP_EXT_SECURITY;
+	} else if (!(vcp->vc_sopt.sv_sm & SMB_SM_USER)) {
+		/*
+		 * In the share security mode password will be used
+		 * only in the tree authentication
+		 */
+		 pp = "";
+		 plen = 1;
+		 unipp = &smb_unieol;
+		 uniplen = sizeof(smb_unieol);
+	} else {
+		pbuf = malloc(SMB_MAXPASSWORDLEN + 1, M_SMBTEMP, M_WAITOK);
+		encpass = malloc(24, M_SMBTEMP, M_WAITOK);
 		/*
 		 * We try w/o uppercasing first so Samba mixed case
 		 * passwords work.  If that fails we come back and try
@@ -328,13 +393,11 @@ again:
 			strncpy(pbuf, smb_vc_getpass(vcp), SMB_MAXPASSWORDLEN);
 			pbuf[SMB_MAXPASSWORDLEN] = '\0';
 		}
+#ifdef APPLE
 		if (!SMB_UNICODE_STRINGS(vcp))
+#endif /* APPLE */
 			iconv_convstr(vcp->vc_toserver, pbuf, pbuf,
 				      SMB_MAXPASSWORDLEN);
-#else
-		iconv_convstr(vcp->vc_toupper, pbuf, smb_vc_getpass(vcp), SMB_MAXPASSWORDLEN);
-		iconv_convstr(vcp->vc_toserver, pbuf, pbuf, SMB_MAXPASSWORDLEN);
-#endif /* APPLE */
 		if (vcp->vc_sopt.sv_sm & SMB_SM_ENCRYPT) {
 			uniplen = plen = 24;
 			smb_encrypt(pbuf, vcp->vc_ch, encpass);
@@ -345,13 +408,10 @@ again:
 					SMB_MAXPASSWORDLEN);
 				pbuf[SMB_MAXPASSWORDLEN] = '\0';
 			} else
+#endif /* APPLE */
 				iconv_convstr(vcp->vc_toserver, pbuf,
 					      smb_vc_getpass(vcp),
 					      SMB_MAXPASSWORDLEN);
-#else
-			iconv_convstr(vcp->vc_toserver, pbuf,
-				      smb_vc_getpass(vcp), SMB_MAXPASSWORDLEN);
-#endif /* APPLE */
 			smb_ntencrypt(pbuf, vcp->vc_ch, (u_char*)ntencpass);
 			pp = encpass;
 			unipp = ntencpass;
@@ -371,27 +431,16 @@ again:
 			uniplen = 0/*-= 2*/;
 			unipp = ntencpass;
 		}
-	} else {
-		/*
-		 * In the share security mode password will be used
-		 * only in the tree authentication
-		 */
-		 pp = "";
-		 plen = 1;
-		 unipp = &smb_unieol;
-		 uniplen = sizeof(smb_unieol);
 	}
 	smb_rq_wstart(rqp);
 	mbp = &rqp->sr_rq;
 	up = vcp->vc_username;
-#ifdef APPLE
 	/*
 	 * If userid is null we are attempting anonymous browse login
 	 * so passwords must be zero length.
 	 */
 	if (*up == '\0')
 		plen = uniplen = 0;
-#endif /* APPLE */
 	ulen = strlen(up) + 1;
 	mb_put_uint8(mbp, 0xff);
 	mb_put_uint8(mbp, 0);
@@ -400,50 +449,90 @@ again:
 	mb_put_uint16le(mbp, vcp->vc_sopt.sv_maxmux);
 	mb_put_uint16le(mbp, vcp->vc_number);
 	mb_put_uint32le(mbp, vcp->vc_sopt.sv_skey);
-	mb_put_uint16le(mbp, plen);
 	if (SMB_DIALECT(vcp) < SMB_DIALECT_NTLM0_12) {
+		mb_put_uint16le(mbp, plen);
 		mb_put_uint32le(mbp, 0);
 		smb_rq_wend(rqp);
 		smb_rq_bstart(rqp);
 		mb_put_mem(mbp, pp, plen, MB_MSYSTEM);
 		smb_put_dstring(mbp, vcp, up, SMB_CS_NONE);
 	} else {
-		mb_put_uint16le(mbp, uniplen);
-		mb_put_uint32le(mbp, 0);		/* reserved */
+		if (vcp->vc_intok) {
+			mb_put_uint16le(mbp, vcp->vc_intoklen);
+			mb_put_uint32le(mbp, 0);		/* reserved */
+			mb_put_uint32le(mbp, caps);		/* my caps */
+			smb_rq_wend(rqp);
+			smb_rq_bstart(rqp);
+			mb_put_mem(mbp, vcp->vc_intok, vcp->vc_intoklen,
+				   MB_MSYSTEM);	/* security blob */
+		} else {
+			mb_put_uint16le(mbp, plen);
+			mb_put_uint16le(mbp, uniplen);
+			mb_put_uint32le(mbp, 0);		/* reserved */
+			mb_put_uint32le(mbp, caps);		/* my caps */
+			smb_rq_wend(rqp);
+			smb_rq_bstart(rqp);
+			mb_put_mem(mbp, pp, plen, MB_MSYSTEM); /* password */
+			mb_put_mem(mbp, (caddr_t)unipp, uniplen, MB_MSYSTEM);
+			smb_put_dstring(mbp, vcp, up, SMB_CS_NONE); /* user */
+			smb_put_dstring(mbp, vcp, vcp->vc_domain, SMB_CS_NONE);
+		}
 #ifdef APPLE
-		mb_put_uint32le(mbp, vcp->obj.co_flags & SMBV_UNICODE ?
-				     SMB_CAP_UNICODE : 0);
+		smb_put_dstring(mbp, vcp, "MacOSX", SMB_CS_NONE);
 #else
-		mb_put_uint32le(mbp, 0);		/* my caps */
+		smb_put_dstring(mbp, vcp, "FreeBSD", SMB_CS_NONE);
 #endif /* APPLE */
-		smb_rq_wend(rqp);
-		smb_rq_bstart(rqp);
-		mb_put_mem(mbp, pp, plen, MB_MSYSTEM);
-		mb_put_mem(mbp, (caddr_t)unipp, uniplen, MB_MSYSTEM);
-		smb_put_dstring(mbp, vcp, up, SMB_CS_NONE);		/* AccountName */
-		smb_put_dstring(mbp, vcp, vcp->vc_domain, SMB_CS_NONE);	/* PrimaryDomain */
-		smb_put_dstring(mbp, vcp, "FreeBSD", SMB_CS_NONE);	/* Client's OS */
-		smb_put_dstring(mbp, vcp, "NETSMB", SMB_CS_NONE);		/* Client name */
+		smb_put_dstring(mbp, vcp, "NETSMB", SMB_CS_NONE); /* LAN Mgr */
 	}
 	smb_rq_bend(rqp);
 	if (ntencpass)
 		free(ntencpass, M_SMBTEMP);
-	error = smb_rq_simple(rqp);
+	error = smb_rq_simple_timed(rqp, SMBSSNSETUPTIMO);
 	SMBSDEBUG("%d\n", error);
 	if (error) {
 		if (rqp->sr_errclass == ERRDOS && rqp->sr_serror == ERRnoaccess)
 			error = EAUTH;
-		goto bad;
+		if (!(rqp->sr_errclass == ERRDOS &&
+		      rqp->sr_serror == ERRmoredata))
+			goto bad;
 	}
 	vcp->vc_smbuid = rqp->sr_rpuid;
+	smb_rq_getreply(rqp, &mdp);
+	do {
+		error = md_get_uint8(mdp, &wc);
+		if (error)
+			break;
+		error = EBADRPC;
+		if (vcp->vc_intok) {
+			if (wc != 4)
+				break;
+		} else if (wc != 3)
+			break;
+		md_get_uint8(mdp, NULL);	/* secondary cmd */
+		md_get_uint8(mdp, NULL);	/* mbz */
+		md_get_uint16le(mdp, NULL);	/* andxoffset */
+		md_get_uint16le(mdp, NULL);	/* action */
+		if (vcp->vc_intok)
+			md_get_uint16le(mdp, &bl);	/* ext security */
+		md_get_uint16le(mdp, NULL); /* byte count */
+		if (vcp->vc_intok) {
+			vcp->vc_outtoklen =  bl;
+			vcp->vc_outtok = malloc(bl, M_SMBTEMP, M_WAITOK);
+			error = md_get_mem(mdp, vcp->vc_outtok, bl, MB_MSYSTEM);
+			if (error)
+				break;
+		}
+		/* server OS, LANMGR, & Domain here*/
+		error = 0;
+	} while (0);
 bad:
-	free(encpass, M_SMBTEMP);
-	free(pbuf, M_SMBTEMP);
+	if (encpass)
+		free(encpass, M_SMBTEMP);
+	if (pbuf)
+		free(pbuf, M_SMBTEMP);
 	smb_rq_done(rqp);
-#ifdef APPLE
 	if (error && upper == 1 && vcp->vc_sopt.sv_sm & SMB_SM_USER)
 		goto again;
-#endif /* APPLE */
 	return error;
 }
 
@@ -516,30 +605,37 @@ smb_smb_treeconnect(struct smb_share *ssp, struct smb_cred *scred)
 #ifdef APPLE
 	int upper = 0;
 
-again:
-
-	/* Disable Unicode for SMB_COM_TREE_CONNECT_ANDX requests */
-	if (SSTOVC(ssp)->vc_hflags2 & SMB_FLAGS2_UNICODE) {
-		vcp = SSTOVC(ssp);
-		if (vcp->vc_toserver) {
-			iconv_close(vcp->vc_toserver);
-			/* Use NULL until UTF-8 -> ASCII works */
-			vcp->vc_toserver = NULL;
-		}
-		if (vcp->vc_tolocal) {
-			iconv_close(vcp->vc_tolocal);
-			/* Use NULL until ASCII -> UTF-8 works*/
-			vcp->vc_tolocal = NULL;
-		}
-		vcp->vc_hflags2 &= ~SMB_FLAGS2_UNICODE;
-	}
+ again:
+        vcp = SSTOVC(ssp);
+        
+        /* Disable Unicode for SMB_COM_TREE_CONNECT_ANDX requests */
+	if (vcp->vc_hflags2 & SMB_FLAGS2_UNICODE) {
+                vcp->vc_hflags2 &= ~SMB_FLAGS2_UNICODE;
+	} 
+	
+        /* 
+         * Disable the converters during the request. With Unicode off, strings from 
+         * Windows servers will likely be encoded with their local system encoding.
+         * If we try to convert them and fail then the treeconnect will fail. In this function,
+         * we can just use the strings as they're given to us. The converters are enabled
+         * on exit.
+         */
+	if (vcp->vc_toserver) {
+		iconv_close(vcp->vc_toserver);
+		/* Use NULL until UTF-8 -> ASCII works */
+                vcp->vc_toserver = NULL;
+        }
+        if (vcp->vc_tolocal) {
+                iconv_close(vcp->vc_tolocal);
+                /* Use NULL until ASCII -> UTF-8 works*/
+                vcp->vc_tolocal = NULL;
+        }
 #endif
-
+	
 	ssp->ss_tid = SMB_TID_UNKNOWN;
 	error = smb_rq_alloc(SSTOCP(ssp), SMB_COM_TREE_CONNECT_ANDX, scred, &rqp);
 	if (error)
 		return error;
-	vcp = rqp->sr_vc;
 	caseopt = SMB_CS_NONE;
 	if (vcp->vc_sopt.sv_sm & SMB_SM_USER) {
 		plen = 1;
@@ -587,13 +683,25 @@ again:
 	mb_put_uint16le(mbp, plen);
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
-	mb_put_mem(mbp, pp, plen, MB_MSYSTEM);
+	error = mb_put_mem(mbp, pp, plen, MB_MSYSTEM);
+	if (error) {
+		SMBERROR("error %d from mb_put_mem for pp\n", error);
+		goto bad;
+	}
 	smb_put_dmem(mbp, vcp, "\\\\", 2, caseopt);
 	pp = vcp->vc_srvname;
-	smb_put_dmem(mbp, vcp, pp, strlen(pp), caseopt);
+	error = smb_put_dmem(mbp, vcp, pp, strlen(pp), caseopt);
+	if (error) {
+		SMBERROR("error %d from smb_put_dmem for srvname\n", error);
+		goto bad;
+	}
 	smb_put_dmem(mbp, vcp, "\\", 1, caseopt);
 	pp = ssp->ss_name;
-	smb_put_dstring(mbp, vcp, pp, caseopt);
+	error = smb_put_dstring(mbp, vcp, pp, caseopt);
+	if (error) {
+		SMBERROR("error %d from smb_put_dstring for ss_name\n", error);
+		goto bad;
+	}
 	pp = smb_share_typename(ssp->ss_type);
 	smb_put_dstring(mbp, vcp, pp, caseopt);
 	smb_rq_bend(rqp);
@@ -629,7 +737,8 @@ again:
 	} else if (vcp->vc_toserver == NULL) {
 		void *servercharset = NULL;
 		void *localcharset = NULL;
-
+		
+                /* todo: if we can't determine the server's encoding, we need to try a best-guess here */
 		if (iconv_open("cp437", "utf-8", &servercharset) != 0)
 			goto bad;
 		if (iconv_open("utf-8", "cp437", &localcharset) != 0) {
@@ -702,13 +811,13 @@ smb_smb_readx(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 	mb_put_uint8(mbp, 0);		/* MBZ */
 	mb_put_uint16le(mbp, 0);	/* offset to secondary */
 	mb_put_mem(mbp, (caddr_t)&fid, sizeof(fid), MB_MSYSTEM);
-	mb_put_uint32le(mbp, uio->uio_offset);
+	mb_put_uint32le(mbp, (u_int32_t)uio->uio_offset);
 	*len = min(SSTOVC(ssp)->vc_rxmax, *len);
-	mb_put_uint16le(mbp, *len);	/* MaxCount */
-	mb_put_uint16le(mbp, *len);	/* MinCount (only indicates blocking) */
+	mb_put_uint16le(mbp, (u_int16_t)*len);	/* MaxCount */
+	mb_put_uint16le(mbp, (u_int16_t)*len);	/* MinCount (only indicates blocking) */
 	mb_put_uint32le(mbp, (unsigned)*len >> 16);	/* MaxCountHigh */
-	mb_put_uint16le(mbp, *len);	/* Remaining ("obsolete") */
-	mb_put_uint32le(mbp, uio->uio_offset >> 32);	/* OffsetHigh */
+	mb_put_uint16le(mbp, (u_int16_t)*len);	/* Remaining ("obsolete") */
+	mb_put_uint32le(mbp, (u_int32_t)((u_int64_t)uio->uio_offset >> 32));
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
 	smb_rq_bend(rqp);
@@ -764,7 +873,7 @@ smb_smb_readx(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 
 static __inline int
 smb_smb_writex(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
-	struct uio *uio, struct smb_cred *scred)
+	struct uio *uio, struct smb_cred *scred, int timo)
 {
 	struct smb_rq *rqp;
 	struct mbchain *mbp;
@@ -773,6 +882,13 @@ smb_smb_writex(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 	u_int8_t wc;
 	u_int16_t resid;
 
+	if (SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_WRITEX) {
+		*len = min(*len, 0x1ffff);
+	} else {
+		*len = min(*len, min(0xffff,
+				     SSTOVC(ssp)->vc_txmax - SMB_HDRLEN - 34));
+		/* (data starts 18 bytes further in than SMB_COM_WRITE) */
+	}
 	error = smb_rq_alloc(SSTOCP(ssp), SMB_COM_WRITE_ANDX, scred, &rqp);
 	if (error)
 		return (error);
@@ -782,15 +898,15 @@ smb_smb_writex(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 	mb_put_uint8(mbp, 0);		/* MBZ */
 	mb_put_uint16le(mbp, 0);	/* offset to secondary */
 	mb_put_mem(mbp, (caddr_t)&fid, sizeof(fid), MB_MSYSTEM);
-	mb_put_uint32le(mbp, uio->uio_offset);
+	mb_put_uint32le(mbp, (u_int32_t)uio->uio_offset);
 	mb_put_uint32le(mbp, 0);	/* MBZ (timeout) */
 	mb_put_uint16le(mbp, 0);	/* !write-thru */
 	mb_put_uint16le(mbp, 0);
 	*len = min(SSTOVC(ssp)->vc_wxmax, *len);
-	mb_put_uint16le(mbp, (unsigned)*len >> 16);
-	mb_put_uint16le(mbp, *len);
+	mb_put_uint16le(mbp, (u_int16_t)((unsigned)*len >> 16));
+	mb_put_uint16le(mbp, (u_int16_t)*len);
 	mb_put_uint16le(mbp, 64);	/* data offset from header start */
-	mb_put_uint32le(mbp, uio->uio_offset >> 32);	/* OffsetHigh */
+	mb_put_uint32le(mbp, (u_int32_t)((u_int64_t)uio->uio_offset >> 32));
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
 	do {
@@ -799,7 +915,8 @@ smb_smb_writex(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 		if (error)
 			break;
 		smb_rq_bend(rqp);
-		error = smb_rq_simple(rqp);
+		error = timo ? smb_rq_simple_timed(rqp, timo)
+			     : smb_rq_simple(rqp);
 		if (error)
 			break;
 		smb_rq_getreply(rqp, &mdp);
@@ -811,8 +928,16 @@ smb_smb_writex(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 		md_get_uint8(mdp, NULL);
 		md_get_uint8(mdp, NULL);
 		md_get_uint16le(mdp, NULL);
-		md_get_uint16le(mdp, &resid);
+		md_get_uint16le(mdp, &resid); /* actually is # written */
 		*rresid = resid;
+		/*
+		 * if LARGE_WRITEX then there's one more bit of # written
+		 */
+		if ((SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_WRITEX)) {
+			md_get_uint16le(mdp, NULL);
+			md_get_uint16le(mdp, &resid);
+			*rresid |= (int)(resid & 1) << 16;
+		}
 	} while(0);
 
 	smb_rq_done(rqp);
@@ -828,24 +953,24 @@ smb_smb_read(struct smb_share *ssp, u_int16_t fid,
 	struct mdchain *mdp;
 	u_int16_t resid, bc;
 	u_int8_t wc;
-	int error, rlen, blksz;
+	int error, rlen;
 
-	if (SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_READX)
+	if (SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_FILES ||
+	    SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_READX)
 		return (smb_smb_readx(ssp, fid, len, rresid, uio, scred));
 
 	error = smb_rq_alloc(SSTOCP(ssp), SMB_COM_READ, scred, &rqp);
 	if (error)
 		return error;
 
-	blksz = SSTOVC(ssp)->vc_txmax - SMB_HDRLEN - 16;
-	rlen = *len = min(blksz, *len);
+	*len = rlen = min(*len, min(0xffff, SSTOVC(ssp)->vc_txmax - SMB_HDRLEN - 16));
 
 	smb_rq_getrequest(rqp, &mbp);
 	smb_rq_wstart(rqp);
 	mb_put_mem(mbp, (caddr_t)&fid, sizeof(fid), MB_MSYSTEM);
-	mb_put_uint16le(mbp, rlen);
-	mb_put_uint32le(mbp, uio->uio_offset);
-	mb_put_uint16le(mbp, min(uio->uio_resid, 0xffff));
+	mb_put_uint16le(mbp, (u_int16_t)rlen);
+	mb_put_uint32le(mbp, (u_int32_t)uio->uio_offset);
+	mb_put_uint16le(mbp, (u_int16_t)min(uio->uio_resid, 0xffff));
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
 	smb_rq_bend(rqp);
@@ -900,33 +1025,36 @@ smb_read(struct smb_share *ssp, u_int16_t fid, struct uio *uio,
 
 static __inline int
 smb_smb_write(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
-	struct uio *uio, struct smb_cred *scred)
+	struct uio *uio, struct smb_cred *scred, int timo)
 {
 	struct smb_rq *rqp;
 	struct mbchain *mbp;
 	struct mdchain *mdp;
 	u_int16_t resid;
 	u_int8_t wc;
-	int error, blksz;
+	int error;
 
-	if (*len && SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_WRITEX)
-		return (smb_smb_writex(ssp, fid, len, rresid, uio, scred));
-
-	blksz = SSTOVC(ssp)->vc_txmax - SMB_HDRLEN - 16;
-	if (blksz > 0xffff)
-		blksz = 0xffff;
-
-	resid = *len = min(blksz, *len);
+	if (uio->uio_offset + *len > UINT32_MAX &&
+	    !(SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_FILES))
+		return (EFBIG);
+	if (*len && (SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_FILES ||
+		     SSTOVC(ssp)->vc_sopt.sv_caps & SMB_CAP_LARGE_WRITEX))
+		return (smb_smb_writex(ssp, fid, len, rresid,
+				       uio, scred, timo));
 
 	error = smb_rq_alloc(SSTOCP(ssp), SMB_COM_WRITE, scred, &rqp);
 	if (error)
 		return error;
+
+	resid = min(*len, min(0xffff, SSTOVC(ssp)->vc_txmax - SMB_HDRLEN - 16));
+	*len = resid;
+
 	smb_rq_getrequest(rqp, &mbp);
 	smb_rq_wstart(rqp);
 	mb_put_mem(mbp, (caddr_t)&fid, sizeof(fid), MB_MSYSTEM);
 	mb_put_uint16le(mbp, resid);
-	mb_put_uint32le(mbp, uio->uio_offset);
-	mb_put_uint16le(mbp, min(uio->uio_resid, 0xffff));
+	mb_put_uint32le(mbp, (u_int32_t)uio->uio_offset);
+	mb_put_uint16le(mbp, (u_int16_t)min(uio->uio_resid, 0xffff));
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
 	mb_put_uint8(mbp, SMB_DT_DATA);
@@ -936,7 +1064,8 @@ smb_smb_write(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 		if (error)
 			break;
 		smb_rq_bend(rqp);
-		error = smb_rq_simple(rqp);
+		error = timo ? smb_rq_simple_timed(rqp, timo)
+			     : smb_rq_simple(rqp);
 		if (error)
 			break;
 		smb_rq_getreply(rqp, &mdp);
@@ -954,7 +1083,7 @@ smb_smb_write(struct smb_share *ssp, u_int16_t fid, int *len, int *rresid,
 
 int
 smb_write(struct smb_share *ssp, u_int16_t fid, struct uio *uio,
-	struct smb_cred *scred)
+	struct smb_cred *scred, int timo)
 {
 	int error = 0, len, tsize, resid;
 	struct uio olduio;
@@ -963,7 +1092,8 @@ smb_write(struct smb_share *ssp, u_int16_t fid, struct uio *uio,
 	olduio = *uio;
 	while (tsize > 0) {
 		len = tsize;
-		error = smb_smb_write(ssp, fid, &len, &resid, uio, scred);
+		error = smb_smb_write(ssp, fid, &len, &resid, uio, scred, timo);
+		timo = 0; /* only first write is special */
 		if (error)
 			break;
 		if (resid < len) {
@@ -985,8 +1115,9 @@ smb_write(struct smb_share *ssp, u_int16_t fid, struct uio *uio,
 	return error;
 }
 
+static u_int32_t	smbechoes = 0;
 int
-smb_smb_echo(struct smb_vc *vcp, struct smb_cred *scred)
+smb_smb_echo(struct smb_vc *vcp, struct smb_cred *scred, int timo)
 {
 	struct smb_rq *rqp;
 	struct mbchain *mbp;
@@ -997,10 +1128,34 @@ smb_smb_echo(struct smb_vc *vcp, struct smb_cred *scred)
 		return error;
 	mbp = &rqp->sr_rq;
 	smb_rq_wstart(rqp);
-	mb_put_uint16le(mbp, 1);
+	mb_put_uint16le(mbp, 1); /* echo count */
 	smb_rq_wend(rqp);
 	smb_rq_bstart(rqp);
-	mb_put_uint32le(mbp, 0);
+	smbechoes++;
+	mb_put_uint32le(mbp, smbechoes);
+	smb_rq_bend(rqp);
+	error = smb_rq_simple_timed(rqp, timo);
+	SMBSDEBUG("%d\n", error);
+	smb_rq_done(rqp);
+	return error;
+}
+
+int
+smb_smb_checkdir(struct smb_share *ssp, struct smbnode *dnp, char *name, int nmlen, struct smb_cred *scred)
+{
+	struct smb_rq *rqp;
+	struct mbchain *mbp;
+	int error;
+
+	error = smb_rq_alloc(SSTOCP(ssp), SMB_COM_CHECK_DIRECTORY, scred, &rqp);
+	if (error)
+		return error;
+	smb_rq_getrequest(rqp, &mbp);
+	smb_rq_wstart(rqp);
+	smb_rq_wend(rqp);
+	smb_rq_bstart(rqp);
+	mb_put_uint8(mbp, SMB_DT_ASCII);
+	smbfs_fullpath(mbp, SSTOVC(ssp), dnp, name, nmlen);
 	smb_rq_bend(rqp);
 	error = smb_rq_simple(rqp);
 	SMBSDEBUG("%d\n", error);
