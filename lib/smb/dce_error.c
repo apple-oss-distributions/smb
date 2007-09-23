@@ -3,6 +3,9 @@
  * (c) Copyright 1991 OPEN SOFTWARE FOUNDATION, INC.
  * (c) Copyright 1991 HEWLETT-PACKARD COMPANY
  * (c) Copyright 1991 DIGITAL EQUIPMENT CORPORATION
+ *
+ * Portions Copyright (C) 2005 - 2007 Apple Inc. All rights reserved.
+ *
  * To anyone who acknowledges that this file is provided "AS IS"
  * without any express or implied warranty:
  *                 permission to use, copy, modify, and distribute this
@@ -195,9 +198,9 @@ int                     *status;
     component_name[0] = alphabet[component_code / 40];
 
     if (fname != NULL)
-        sprintf (fname, "%3s", facility_name);
+        sprintf ((char *)fname, "%3s", facility_name);
     if (cname != NULL)
-        sprintf (cname, "%3s", component_name);
+        sprintf ((char *)cname, "%3s", component_name);
 
     sprintf (filename_prefix, "%3s%3s", facility_name, component_name);
 
@@ -275,11 +278,11 @@ int                     *status;
     }
 
     dce_get_msg (status_to_convert, error_text, fname, cname, status);
-    strcat (error_text, " (");
-    strcat (error_text, fname);
-    strcat (error_text, " / ");
-    strcat (error_text, cname);
-    strcat (error_text, ")");
+    strcat ((char *)error_text, " (");
+    strcat ((char *)error_text, fname);
+    strcat ((char *)error_text, " / ");
+    strcat ((char *)error_text, cname);
+    strcat ((char *)error_text, ")");
 }
 
 int dce_fprintf(FILE *f, unsigned long index, ...)

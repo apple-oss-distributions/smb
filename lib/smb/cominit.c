@@ -3,6 +3,9 @@
  * (c) Copyright 1989 OPEN SOFTWARE FOUNDATION, INC.
  * (c) Copyright 1989 HEWLETT-PACKARD COMPANY
  * (c) Copyright 1989 DIGITAL EQUIPMENT CORPORATION
+ *
+ * Portions Copyright (C) 2005 - 2007 Apple Inc. All rights reserved.
+ *
  * To anyone who acknowledges that this file is provided "AS IS"
  * without any express or implied warranty:
  *                 permission to use, copy, modify, and distribute this
@@ -101,10 +104,10 @@ GLOBAL   pthread_t      init_thread;
 
 
 /*
- * Don't do the getenv() stuff if not built with DEBUG #define'd
+ * Don't do the getenv() stuff if not built with DEBUG_DCE_RPC #define'd
  */
 
-#if !defined(DEBUG) && !defined(NO_GETENV)
+#if !defined(DEBUG_DCE_RPC) && !defined(NO_GETENV)
 #  define NO_GETENV
 #endif
 
@@ -322,7 +325,7 @@ INTERNAL void init_once(void)
         dce_error_string_t error_text;
         int temp_status;
 
-        dce_error_inq_text(status, error_text, &temp_status);
+        dce_error_inq_text(status, (unsigned char *)error_text, &temp_status);
 
 	/*
 	 * rpc_m_call_failed
@@ -347,7 +350,7 @@ INTERNAL void init_once(void)
         dce_error_string_t error_text;
         int temp_status;
 
-        dce_error_inq_text(status, error_text, &temp_status);
+        dce_error_inq_text(status, (unsigned char *)error_text, &temp_status);
 
 	/*
 	 * rpc_m_call_failed
@@ -440,7 +443,7 @@ INTERNAL void init_once(void)
                     dce_error_string_t error_text;
                     int temp_status;
 
-                    dce_error_inq_text(status, error_text, &temp_status);
+                    dce_error_inq_text(status, (unsigned char *)error_text, &temp_status);
 
 		    /*
 		     * rpc_m_call_failed
@@ -514,7 +517,7 @@ INTERNAL void init_once(void)
         dce_error_string_t error_text;
         int temp_status;
 
-        dce_error_inq_text(status, error_text, &temp_status);
+        dce_error_inq_text(status, (unsigned char *)error_text, &temp_status);
 
 	/*
 	 * rpc_m_call_failed
@@ -675,7 +678,7 @@ INTERNAL void init_once(void)
         dce_error_string_t error_text;
         int temp_status;
 
-        dce_error_inq_text(status, error_text, &temp_status);
+        dce_error_inq_text(status, (unsigned char *)error_text, &temp_status);
 
 	/*
 	 * rpc_m_call_failed
@@ -1521,7 +1524,7 @@ PRIVATE void rpc__fork_handler
         /*
          * Reset any debug switches.
          */       
-#ifdef DEBUG
+#ifdef DEBUG_DCE_RPC
         if (!RPC_DBG(rpc_es_dbg_inherit, 1))
         {
             for (ctr = 0; ctr < RPC_C_DBG_SWITCHES; ctr++)

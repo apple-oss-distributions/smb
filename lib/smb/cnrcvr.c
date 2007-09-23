@@ -3,6 +3,9 @@
  * (c) Copyright 1989 OPEN SOFTWARE FOUNDATION, INC.
  * (c) Copyright 1989 HEWLETT-PACKARD COMPANY
  * (c) Copyright 1989 DIGITAL EQUIPMENT CORPORATION
+ *
+ * Portions Copyright (C) 2005 - 2007 Apple Inc. All rights reserved.
+ *
  * To anyone who acknowledges that this file is provided "AS IS"
  * without any express or implied warranty:
  *                 permission to use, copy, modify, and distribute this
@@ -770,7 +773,7 @@ INTERNAL void receive_dispatch
                             dce_error_string_t error_text;
                             int temp_status;
 
-                            dce_error_inq_text(auth_st, error_text, &temp_status);
+                            dce_error_inq_text(auth_st, (unsigned char *)error_text, &temp_status);
                             /*
 			     * rpc_m_call_failed_s
 			     * "%s on server failed: %s"
@@ -822,16 +825,14 @@ INTERNAL void receive_dispatch
          * Finally, post the event to the appropriate state machine
          */
         if (packet_info_table[ptype].class == CALL_CLASS_PKT)
-        {
-            if ((ptype == RPC_C_CN_PKT_REQUEST) 
-                && 
-                (RPC_CN_PKT_FLAGS (pktp) & RPC_C_CN_FLAGS_FIRST_FRAG))
-            {
-
-                /*
-                 * We don't support acting as a server.  Indicate an
-                 * error.
-                 */
+		{
+			if (ptype == RPC_C_CN_PKT_FAULT) {
+				/* Server returned an error, we are done. */
+				rpc__cn_assoc_post_error (assoc, rpc_s_connection_closed);
+			}
+			else if ((ptype == RPC_C_CN_PKT_REQUEST)  && (RPC_CN_PKT_FLAGS (pktp) & RPC_C_CN_FLAGS_FIRST_FRAG))
+			{
+				/* We don't support acting as a server.  Indicate an error. */
                 rpc__cn_assoc_post_error (assoc, rpc_s_connection_closed);
             }
             else
@@ -946,7 +947,14 @@ INTERNAL void receive_packet
     int                        bytes_rcvd;
     rpc_cn_packet_p_t          pktp;
     rpc_socket_iovec_t         iov;
-    rpc_socket_error_t         serr;
+    /* 
+     * serr needs protection for longjump,
+     * fork. Otherwise compiler might not 
+     * update register properly. Also if 
+     * not declared volatile you get a
+     * compiler warning :) 
+     */  
+    volatile rpc_socket_error_t         serr=0;
     volatile signed32          need_bytes;
 
     RPC_LOG_CN_RCV_PKT_NTR;

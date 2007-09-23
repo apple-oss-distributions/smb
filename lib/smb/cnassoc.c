@@ -3,6 +3,9 @@
  * (c) Copyright 1989 OPEN SOFTWARE FOUNDATION, INC.
  * (c) Copyright 1989 HEWLETT-PACKARD COMPANY
  * (c) Copyright 1989 DIGITAL EQUIPMENT CORPORATION
+ *
+ * Portions Copyright (C) 2004 - 2007 Apple Inc. All rights reserved.
+ *
  * To anyone who acknowledges that this file is provided "AS IS"
  * without any express or implied warranty:
  *                 permission to use, copy, modify, and distribute this
@@ -52,6 +55,7 @@
 #include <cncall.h>     /* NCA connection call service */
 #include <cnassoc.h>    
 #include <rpc_cleanup.h>
+#include <rpcdbg.h>
 
 /******************************************************************************/
 /*
@@ -131,7 +135,7 @@ INTERNAL void rpc__cn_assoc_alter_context(
 
 INTERNAL void rpc__cn_assoc_reclaim(
     rpc_cn_local_id_t            /*grp_id*/,
-    unsigned32                   /*type*/,
+    pointer_t				/*type*/,
     boolean32			 /*loop*/);
 
 /*
@@ -305,7 +309,7 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
     rpc_cn_assoc_grp_t  *volatile assoc_grp;
     rpc_addr_p_t        rpc_addr;
     volatile unsigned32 wait_interval, total_wait;
-    rpc_cn_local_id_t   grp_id;
+    volatile rpc_cn_local_id_t   grp_id;
     volatile rpc_cn_local_id_t rem_grp_id;
     struct timespec     timespec;
     struct timespec     abstime;
@@ -317,7 +321,11 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
     volatile boolean    i_hold_grp_new_mutex;
 
     volatile boolean32  retry_op;
+	
+#ifdef SUPPORT_DCE_RPC_FIVE_ONE
     volatile boolean    old_server = false;
+#endif // SUPPORT_DCE_RPC_FIVE_ONE
+
     unsigned32          temp_st;
 
     RPC_LOG_CN_ASSOC_REQ_NTR;
@@ -614,10 +622,14 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
              */
             RPC_CN_ASSOC_ACB_INC_REF (assoc);
             assoc->assoc_ref_count++;
+			
+#ifdef SUPPORT_DCE_RPC_FIVE_ONE
+			/* See code down below for comments */
             if (old_server)
             {
                 assoc->assoc_vers_minor = RPC_C_CN_PROTO_VERS_COMPAT;
             }
+#endif // SUPPORT_DCE_RPC_FIVE_ONE
 
             /*
              * Store the call rep in the association for use
@@ -711,6 +723,20 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
                                  assoc->cn_ctlblk.cn_sock,
                                  *st));
                 
+#ifdef SUPPORT_DCE_RPC_FIVE_ONE
+				/*
+				 * This code seems broken to me. The old code always tried 5.1 and then fell back to 5.0. Seems 
+				 * Windows 2003 only supports 5.0. This was causing us about four extra transactions for every share
+				 * list lookup. So for now we only support 5.0. Now once we decided to only support 5.0 the code below
+				 * would cause us to get into an infinite loop when connecting to a NetApp server.
+				 *
+				 * In the orignal code we would never get into the code below because we would not back off on the
+				 * version number. Not sure what servers this code was trying to hack around, but it does not seem
+				 * to come into play with any of the servers I have tested with. We will always fall back to the old
+				 * rap calls so they will still get a list of shares.
+				 *
+				 * %%% In Leoard+1 I would like to update/replace the entire DCE-RPC Library code (Radar 4823000)/
+				 */
                 if ((*st == rpc_s_connection_closed) &&
                     ((assoc->assoc_vers_minor == RPC_C_CN_PROTO_VERS_COMPAT) ||
                      (assoc->bind_packets_sent > 1)))
@@ -719,6 +745,7 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
                     old_server = true;
                     continue;
                 }
+#endif // SUPPORT_DCE_RPC_FIVE_ONE
 
                 RPC_CN_ASSOC_ACB_INC_REF (assoc);
                 rpc__cn_assoc_acb_dealloc (assoc);
@@ -776,7 +803,7 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
                          timespec.tv_sec));
         if (!RPC_CN_LOCAL_ID_VALID (grp_id))
         {
-            rpc__cn_assoc_reclaim (grp_id, RPC_C_CN_ASSOC_GRP_CLIENT, true);
+            rpc__cn_assoc_reclaim (grp_id, (pointer_t)RPC_C_CN_ASSOC_GRP_CLIENT, true);
             RPC_CN_UNLOCK ();
             retry_op = true;
             TRY
@@ -813,7 +840,7 @@ PRIVATE rpc_cn_assoc_t *rpc__cn_assoc_request
         {
             assoc_grp = RPC_CN_ASSOC_GRP (grp_id);
             rpc__cn_assoc_reclaim (assoc_grp->grp_id,
-                                   RPC_C_CN_ASSOC_GRP_CLIENT,
+                                   (pointer_t)RPC_C_CN_ASSOC_GRP_CLIENT,
 				   true);
             assoc_grp->grp_assoc_waiters++;
             pthread_get_expiration_np (&timespec, &abstime);
@@ -1738,7 +1765,7 @@ PRIVATE void rpc__cn_assoc_send_frag
 		dce_error_string_t error_text;
 		int temp_status;
 
-		dce_error_inq_text(*st, error_text, &temp_status);
+		dce_error_inq_text(*st, (unsigned char *)error_text, &temp_status);
 
 		/*
 		 * rpc_m_call_failed_s
@@ -1796,7 +1823,7 @@ PRIVATE void rpc__cn_assoc_send_frag
     }
     else
     {
-        requestbuf = iovp->base;
+        requestbuf = (char *)(iovp->base);
     }
 
     /*
@@ -2846,7 +2873,7 @@ INTERNAL void rpc__cn_assoc_open
                                   &assoc_sm_work,
                                   *st);
 
-#ifdef DEBUG
+#ifdef DEBUG_DCE_RPC
     if (RPC_DBG_EXACT(rpc_es_dbg_cn_errors, RPC_C_CN_DBG_ASSOC_REQ_FAIL))
     {
         assoc->assoc_status = RPC_S_CN_DBG_FAILURE;
@@ -3276,7 +3303,7 @@ PRIVATE rpc_cn_sec_context_t *rpc__cn_assoc_sec_alloc
     rpc_cn_sec_context_t        *sec_context;
     rpc_cn_auth_info_t          *cn_info;
 
-#ifdef DEBUG
+#ifdef DEBUG_DCE_RPC
     if (RPC_DBG_EXACT(rpc_es_dbg_cn_errors, RPC_C_CN_DBG_SEC_ALLOC_FAIL))
     {
         *st = RPC_S_CN_DBG_FAILURE;
@@ -3296,7 +3323,7 @@ PRIVATE rpc_cn_sec_context_t *rpc__cn_assoc_sec_alloc
             dce_error_string_t error_text;
             int temp_status;
 
-            dce_error_inq_text(*st, error_text, &temp_status);
+            dce_error_inq_text(*st, (unsigned char *)error_text, &temp_status);
 
 	    /*
 	     * rpc_m_call_failed_s
@@ -3627,7 +3654,7 @@ INTERNAL void rpc__cn_assoc_timer_reclaim
      */
     RPC_CN_LOCAL_ID_CLEAR (grp_id);
     RPC_CN_LOCK ();
-    rpc__cn_assoc_reclaim (grp_id, (unsigned32) type, false);
+    rpc__cn_assoc_reclaim (grp_id, type, false);
     RPC_CN_UNLOCK ();
 }
 
@@ -3672,7 +3699,7 @@ INTERNAL void rpc__cn_assoc_timer_reclaim
 INTERNAL void rpc__cn_assoc_reclaim 
 (
   rpc_cn_local_id_t       grp_id,
-  unsigned32              type,
+  pointer_t		type,
   boolean32		loop
 )
 {
@@ -3708,7 +3735,7 @@ INTERNAL void rpc__cn_assoc_reclaim
 	    if ((!RPC_CN_LOCAL_ID_EQUAL
 		(rpc_g_cn_assoc_grp_tbl.assoc_grp_vector[i].grp_id, grp_id))
 		&&
-		(rpc_g_cn_assoc_grp_tbl.assoc_grp_vector[i].grp_flags & type)
+		(rpc_g_cn_assoc_grp_tbl.assoc_grp_vector[i].grp_flags & (unsigned long)type)
 		&&
 		(rpc_g_cn_assoc_grp_tbl.assoc_grp_vector[i].grp_state.cur_state
 		 == RPC_C_ASSOC_GRP_ACTIVE)
@@ -4501,7 +4528,7 @@ PRIVATE rpc_cn_local_id_t rpc__cn_assoc_grp_alloc
     RPC_CN_DBG_RTN_PRINTF(rpc__cn_assoc_grp_alloc);
     CODING_ERROR (st);
 
-#ifdef DEBUG
+#ifdef DEBUG_DCE_RPC
     if (RPC_DBG_EXACT(rpc_es_dbg_cn_errors, RPC_C_CN_DBG_GRP_ALLOC))
     {
         *st = RPC_S_CN_DBG_FAILURE;
@@ -5131,13 +5158,17 @@ PRIVATE rpc_cn_local_id_t rpc__cn_assoc_grp_lkup_by_id
 )
 {
     rpc_cn_assoc_grp_t  *assoc_grp;
+#if 1 /* Temporary kludge for gcc4 bug: */
+    volatile rpc_cn_local_id_t   ret_grp_id;
+#else
     rpc_cn_local_id_t   ret_grp_id;
+#endif /* End gcc4 kludge */
 
     RPC_LOG_CN_GRP_ID_LKUP_NTR;
     RPC_CN_DBG_RTN_PRINTF(rpc__cn_assoc_grp_lkup_by_id);
     CODING_ERROR (st);
 
-#ifdef DEBUG
+#ifdef DEBUG_DCE_RPC
     if (RPC_DBG_EXACT(rpc_es_dbg_cn_errors,
                       RPC_C_CN_DBG_GRP_LKUP_BY_ID))
     {
