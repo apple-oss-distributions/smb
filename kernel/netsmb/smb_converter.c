@@ -1,9 +1,5 @@
 /*
- *  smb_converter.c
- *  smb
- *
- *  Created by George Colley on 5/2/08.
- *  Copyright 2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2008 - 2009 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -31,17 +27,20 @@
 #include <sys/malloc.h>
 #include <sys/smb_apple.h>
 
+#include <netsmb/smb.h>
+#include <netsmb/smb_conn.h>
 #include <netsmb/smb_subr.h>
 #include <netsmb/smb_converter.h>
+#include <sys/smb_byte_order.h>
 
 /* UCS2 to CodePage Conversion Data */
 typedef struct _UCSTo8BitCharMap {
-    u_int16_t _u;
-    u_int8_t _c;
+    uint16_t _u;
+    uint8_t _c;
 } UCSTo8BitCharMap;
 
 /* CodePage to UCS2 Conversion Data */
-static const u_int16_t cp437_to_ucs2[128] = {
+static const uint16_t cp437_to_ucs2[128] = {
 	0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
 	0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
 	0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
@@ -193,10 +192,10 @@ static const UCSTo8BitCharMap cp437_from_ucs2[128] = {
 };
 
 static int
-codepage_to_ucs2(const u_int16_t *convtbl, const u_int8_t *src, size_t srclen,
-				 size_t bufsize, u_int16_t *unibuf, size_t *unilen)
+codepage_to_ucs2(const uint16_t *convtbl, const uint8_t *src, size_t srclen, 
+				 size_t bufsize, uint16_t *unibuf, size_t *unilen)
 {
-	u_int8_t byte;
+	uint8_t byte;
 	size_t n, r;
 	
 	r = n = MIN(srclen, bufsize/2);
@@ -204,7 +203,7 @@ codepage_to_ucs2(const u_int16_t *convtbl, const u_int8_t *src, size_t srclen,
 	while (r--) {
 		byte = *src++;
 		if (byte < 0x80)
-			*unibuf++ = (u_int16_t)byte;
+			*unibuf++ = (uint16_t)byte;
 		else
 			*unibuf++ = convtbl[byte - 0x80];
 	}
@@ -219,7 +218,7 @@ codepage_to_ucs2(const u_int16_t *convtbl, const u_int8_t *src, size_t srclen,
  */
 static int
 UCSTo8BitEncoding(const UCSTo8BitCharMap *theTable, int numElem,
-				  u_int16_t character, u_int8_t *ch)
+				  uint16_t character, uint8_t *ch)
 {
     const UCSTo8BitCharMap *p, *q, *divider;
 	
@@ -238,11 +237,11 @@ UCSTo8BitEncoding(const UCSTo8BitCharMap *theTable, int numElem,
 }
 
 static void 
-ucs2_to_codepage(const u_int16_t *convtbl, const u_int16_t *src, size_t srclen,
+ucs2_to_codepage(const uint16_t *convtbl, const uint16_t *src, size_t srclen,
 				 size_t bufsize, char *buf, size_t *buflen)
 {
-	u_int16_t character;
-	u_int8_t byte;
+	uint16_t character;
+	uint8_t byte;
 	size_t n, r;
 	
 	r = n = MIN(srclen/2, bufsize);
@@ -250,7 +249,7 @@ ucs2_to_codepage(const u_int16_t *convtbl, const u_int16_t *src, size_t srclen,
 	while (r--) {
 		character = *src++;
 		if (character < 0x80)
-			*buf++ = (u_int8_t)character;
+			*buf++ = (uint8_t)character;
 		else if (UCSTo8BitEncoding((const UCSTo8BitCharMap *)convtbl, 128,
 								   character, &byte))
 			*buf++ = byte;
@@ -261,10 +260,21 @@ ucs2_to_codepage(const u_int16_t *convtbl, const u_int16_t *src, size_t srclen,
 }
 
 /*
- * Convert a UTF8 String to a Network String either UTF16 or Code Page 437
+ * smb_convert_to_network
+ *
+ * Convert a UTF8 String to a Network String either UTF16 or Code Page 437. This
+ * routine should be used when dealing with file type names. We always set the 
+ * precomposed flag, so this routine should not be call for non file type names.
+ * The calling routine needs to set the UTF_SFM_CONVERSIONS if they want SFM 
+ * style mappings for illegal NTFS characters. This routine will handle any 
+ * endian issues.
+ *
+ * NOTE: The UTF_NO_NULL_TERM flags does not apply when to this routine. The old
+ *		 code passed this flag in, but it was always ignored.
  */
-int smb_convert_to_network(const char **inbuf, size_t *inbytesleft, char **outbuf, 
-						   size_t *outbytesleft, int flags, int unicode)
+int 
+smb_convert_to_network(const char **inbuf, size_t *inbytesleft, char **outbuf, 
+						   size_t *outbytesleft, int flags, int usingUnicode)
 {
 	int error;
 	size_t inlen;
@@ -280,17 +290,19 @@ int smb_convert_to_network(const char **inbuf, size_t *inbytesleft, char **outbu
 	
 	flags |= UTF_PRECOMPOSED;
 
-	if (unicode) {
+	if (usingUnicode) {
 		/* Little endian Unicode over the wire */
-		if (unicode && (BYTE_ORDER != LITTLE_ENDIAN))
+		if (BYTE_ORDER != LITTLE_ENDIAN)
 			flags |= UTF_REVERSE_ENDIAN;
-		error = utf8_decodestr((const u_int8_t*)*inbuf, inlen, (u_int16_t *)*outbuf, &outlen, *outbytesleft, 0, flags);
+		error = utf8_decodestr((const uint8_t*)*inbuf, inlen, (uint16_t *)*outbuf, 
+							   &outlen, *outbytesleft, 0, flags);
 		
 	} else {
-		const u_int16_t *cptable = (const u_int16_t *)cp437_from_ucs2;
-		u_int16_t buf[256];	/* When using code pages we only support 256 file names */
+		const uint16_t *cptable = (const uint16_t *)cp437_from_ucs2;
+		uint16_t buf[256];	/* When using code pages we only support 256 file names */
 
-		error = utf8_decodestr((const u_int8_t*)*inbuf, inlen, buf, &outlen, sizeof(buf), 0, flags);
+		error = utf8_decodestr((const uint8_t*)*inbuf, inlen, buf, &outlen, 
+							   sizeof(buf), 0, flags);
 		if (!error)
 			ucs2_to_codepage(cptable, buf, outlen, *outbytesleft, *outbuf, &outlen);
 
@@ -305,8 +317,20 @@ int smb_convert_to_network(const char **inbuf, size_t *inbytesleft, char **outbu
 	return 0;
 }
 
-int smb_convert_from_network(const char **inbuf, size_t *inbytesleft, char **outbuf, 
-							 size_t *outbytesleft, int flags, int unicode)
+/*
+ * smb_convert_from_network
+ *
+ * Convert a Network String either UTF16 or Code Page 437 to UTF8 String. This
+ * routine should be used when dealing with file type names. We always set the 
+ * decomposed flag, so this routine should not be call for non file type names.
+ * Currently we always set the UTF_NO_NULL_TERM, may want to change that in the
+ * future. The calling routine needs to set the UTF_SFM_CONVERSIONS if they want
+ * SFM style mappings for illegal NTFS characters. This routine will handle any 
+ * endian issues.
+ */
+int 
+smb_convert_from_network(const char **inbuf, size_t *inbytesleft, char **outbuf, 
+							 size_t *outbytesleft, int flags, int usingUnicode)
 {
 	int error;
 	size_t inlen;
@@ -321,19 +345,18 @@ int smb_convert_from_network(const char **inbuf, size_t *inbytesleft, char **out
 	outlen = 0;
 	
 	flags |= UTF_DECOMPOSED | UTF_NO_NULL_TERM;
-	if (unicode) {
+	if (usingUnicode) {
 		/* Little endian Unicode over the wire */
-		if (unicode && (BYTE_ORDER != LITTLE_ENDIAN))
+		if (BYTE_ORDER != LITTLE_ENDIAN)
 			flags |= UTF_REVERSE_ENDIAN;
-		error = utf8_encodestr((u_int16_t *)*inbuf, inlen, (u_int8_t *)*outbuf, &outlen, *outbytesleft, 0, flags);	
+		error = utf8_encodestr((uint16_t *)*inbuf, inlen, (uint8_t *)*outbuf, &outlen, *outbytesleft, 0, flags);	
 	} else {
-		const u_int16_t *cptable = (const u_int16_t *)cp437_to_ucs2;
-		u_int16_t buf[256];	/* When using code pages we only support 256 file names */
+		const uint16_t *cptable = (const uint16_t *)cp437_to_ucs2;
+		uint16_t buf[SMB_MAXFNAMELEN*2];	/* When using code pages we only support 256 file names */
 
-		codepage_to_ucs2(cptable, (u_int8_t *)*inbuf, inlen, sizeof(buf), buf, &outlen);
-		error = utf8_encodestr(buf, outlen, (u_int8_t *)*outbuf, &outlen, *outbytesleft, 0, flags);
+		codepage_to_ucs2(cptable, (uint8_t *)*inbuf, inlen, sizeof(buf), buf, &outlen);
+		error = utf8_encodestr(buf, outlen, (uint8_t *)*outbuf, &outlen, *outbytesleft, 0, flags);
 	}
-	
 	if (error)
 		return error;
 	
@@ -342,63 +365,284 @@ int smb_convert_from_network(const char **inbuf, size_t *inbytesleft, char **out
 	*inbytesleft -= inlen;
 	*outbytesleft -= outlen;
 	return 0;
-	
 }
 
-size_t
-smb_strtouni(u_int16_t *dst, const char *src, size_t inlen, int flags)
+/*
+ * smb_strtouni
+ *
+ * Convert a UTF8 String to a UTF16 String. This routine should be used when 
+ * dealing with strings that need to go across the wire as UTF16. We never set
+ * the precomposed/decomposed flag, so the calling routine should pass in
+ * the correct flag.
+ *
+ * NOTE: The UTF_NO_NULL_TERM flags does not apply when used with this routine.
+ *		  The old code passed this flag in, but it was always ignored.
+ */
+size_t 
+smb_strtouni(uint16_t *dst, const char *src, size_t inlen, int flags)
 {
 	size_t outlen;
 	
 	if (BYTE_ORDER != LITTLE_ENDIAN)
 		flags |= UTF_REVERSE_ENDIAN;
-	if (utf8_decodestr((u_int8_t *)src, inlen, dst, &outlen, inlen * 2, 0, flags) != 0)
+	if (utf8_decodestr((uint8_t *)src, inlen, dst, &outlen, inlen * 2, 0, flags) != 0)
 		outlen = 0;
-	if (!(flags & UTF_NO_NULL_TERM)) {
-		dst[outlen/2] = 0;
-		outlen += 2;
-	}       
 	return (outlen);
 }
 
 /*
- * Converts the network UTF-16 string to a UTF-8 string.
- * 
- * NOTES:
- *    The resulting UTF-8 string is NULL terminated.
- * 
- *		dst -	UTF-16
- *		src -	UTF-8
- *		inlen - sizeof UTF16 String
- *		maxlen - size of the src
- *		flags  - 
- *			UTF_REVERSE_ENDIAN: Unicode byteorder is opposite current runtime
- *			UTF_NO_NULL_TERM:  don't add NULL termination to UTF-8 output
+ * smb_unitostr
+ *
+ * Converts the network UTF-16 string to a UTF-8 string. This routine should be 
+ * used when dealing with strings that have come across the wire as UTF16. We never
+ * set the precomposed/decomposed flag, so the calling routine should pass in
+ * the correct flag.
  */
-size_t
-smb_unitostr(char *dst, const u_int16_t *src, size_t inlen, size_t maxlen, int flags)
+size_t 
+smb_unitostr(char *dst, const uint16_t *src, size_t inlen, size_t maxlen, int flags)
 {
 	size_t outlen;
 	
 	if (BYTE_ORDER != LITTLE_ENDIAN)
 		flags |= UTF_REVERSE_ENDIAN;
 	
-	if (utf8_encodestr(src, inlen, (u_int8_t *)dst, &outlen, maxlen, 0, flags) != 0)
+	if (utf8_encodestr(src, inlen, (uint8_t *)dst, &outlen, maxlen, 0, flags) != 0)
 		outlen = 0;
 	
 	return (outlen);
 }
 
 /*
- * Does the same thing as strnlen, except on a utf16 string.
+ * Does the same thing as strnlen, except on a utf16 string. The n_bytes is the 
+ * max number of bytes in the buffer. This routine always return the size in 
+ * the number of bytes.
  */
-size_t
-smb_utf16_strnlen(const uint16_t *s, size_t max) {
-	const uint16_t *es = s + max, *p = s;
+size_t 
+smb_utf16_strnsize(const uint16_t *s, size_t n_bytes) 
+{
+	const uint16_t *es = s, *p = s;
 		
+	/* Make sure es is on even boundry */	
+	es += (n_bytes / 2);
 	while(*p && p != es)  {
 		p++;
 	}
-
 	return (uint8_t *)p - (uint8_t *)s;
+}
+
+/*
+ * Internal strlchr that checks for buffer overflows.
+ */
+static void *
+smb_strlchr(const void *s, uint8_t ch, size_t max) 
+{
+	const uint8_t *str = s;
+	const uint8_t *es = str + max;
+	
+	while(*str && (str != es))  { 
+		if (*str == ch)
+			return (void *)str;
+		str++;
+	}
+	
+	return NULL;
+}
+
+/*
+ * Does the same thing as smb_strlchr, except on a utf16 string.
+ */
+static void *
+smb_utf16_strlchr(const uint16_t *s, uint16_t ch, size_t max) 
+{
+	const uint16_t *es = s, *str = s;
+	
+	/* Make sure es is on even boundry */	
+	es += (max / 2);
+	while(*str && (str != es))  { 
+		if (*str == ch)
+			return (void *)str;
+		str++;
+	}
+	
+	return NULL;
+}
+
+static char *
+set_network_delimiter(char *network, char ntwrk_delimiter, size_t delimiter_size, 
+					  size_t *resid)
+{	
+	if (*resid < delimiter_size)
+		return NULL;
+	*resid -= delimiter_size;
+	if (delimiter_size == 2) {
+		uint16_t *utf16_ptr = (uint16_t *)network;
+		
+		*utf16_ptr++ = htoles((uint16_t)ntwrk_delimiter);
+		return (char *)utf16_ptr;
+	} else {
+		*network++ = ntwrk_delimiter;
+		return network;
+	}
+}
+
+/* 
+ * Given a UTF8 path create a network path
+ *
+ * path				- A UTF8 string. 
+ * max_path_len		- Number of bytes in the path string
+ * network			- Either  UTF16 or ASCII string
+ * ntwrk_len		- On input max buffer size, on output length of network buffer
+ * ntwrk_delimiter	- Delimiter to use
+ * inflags			-
+ *					  SMB_UTF_SFM_CONVERSIONS - Indicates that we should set the 
+ *					  kernel UTF_SFM_CONVERSIONS (Use SFM mappings for illegal NTFS chars)
+ *					  flag. 
+ *					  SMB_FULLPATH_CONVERSIONS - Indicates they want a full path,
+ *					  if the output doesn't start with a delimiter, one should be
+ *					  add.
+ */
+int 
+smb_convert_path_to_network(char *path, size_t max_path_len, char *network, 
+							size_t *ntwrk_len, char ntwrk_delimiter, int inflags, 
+							int usingUnicode)
+{
+	int error = 0;
+	char * delimiter;
+	size_t component_len;	/* component length */
+	size_t path_resid;
+	size_t resid = *ntwrk_len;	/* Room left in the the network buffer */
+	size_t delimiter_size = (usingUnicode) ? 2 : 1;
+	int flags = (inflags & SMB_UTF_SFM_CONVERSIONS) ? UTF_SFM_CONVERSIONS : 0;
+	
+	if ((inflags & SMB_FULLPATH_CONVERSIONS) && (*path != '/')) {
+		network = set_network_delimiter(network, ntwrk_delimiter, delimiter_size, 
+										&resid);
+		if (network == NULL)
+			return E2BIG;
+	}
+	
+	while (path && resid && max_path_len) {
+		DBG_ASSERT(resid > 0);	/* Should never fail */
+		/* Find the next delimiter in the utf-8 string */
+		delimiter = smb_strlchr(path, '/', max_path_len);
+		/* Remove the delimiter so we can get the component */
+		if (delimiter) {
+			max_path_len -= 1; /* consume the delimiter */
+			*delimiter = 0;
+		}
+		/* Get the size of this component */
+		path_resid = component_len = strnlen(path, max_path_len);
+		/* Never SFM dot or dotdot */
+		if (((component_len == 1) && (*path == '.'))  || 
+			((component_len == 2) && (*path == '.') && (*(path+1) == '.'))) {
+			error = smb_convert_to_network((const char **)&path, &path_resid, 
+										   &network, &resid, 0, usingUnicode);
+		
+		} else {
+			error = smb_convert_to_network((const char **)&path, &path_resid, 
+										   &network, &resid, flags, usingUnicode);
+		}
+		if (error)
+			return error;
+		/* Put the path delimiter back and move the pointer pass it */
+		if (delimiter)
+			*delimiter++ = '/';
+		path = delimiter;
+		/* Remove the amount that was consumed by smb_convert_to_network */
+		max_path_len -= (component_len - path_resid);
+		/* If we have more to process then add a network delimiter */
+		if (path) {
+			network = set_network_delimiter(network, ntwrk_delimiter, 
+											delimiter_size, &resid);
+			if (network == NULL)
+				return E2BIG;
+		}
+	}
+	*ntwrk_len -= resid;
+	DBG_ASSERT((ssize_t)(*ntwrk_len) >= 0);
+	return error;
+}
+
+/* 
+ * Given a network string path create a UTF8 path
+ *
+ * network			- Either UTF16 or ASCII string
+ * max_ntwrk_len	- Number of bytes in the network string
+ * path				- UTF8 string. 
+ * path_len			- On input max buffer size, on output length of UTF8 string
+ * ntwrk_delimiter	- Delimiter to use
+ * inflags			-
+ *					  SMB_UTF_SFM_CONVERSIONS - Indicates that we should set the 
+ *					  kernel UTF_SFM_CONVERSIONS (Use SFM mappings for illegal NTFS chars)
+ *					  flag. 
+ *					  SMB_FULLPATH_CONVERSIONS - Indicates they want a full path,
+ *					  if the output doesn't start with a delimiter, one should be
+ *					  add. (Not currently supported, if required should be added.
+ */
+int 
+smb_convert_network_to_path(char *network, size_t max_ntwrk_len, char *path, 
+							size_t *path_len, char ntwrk_delimiter, int flags, 
+							int usingUnicode)
+{
+	int error = 0;
+	char * delimiter;
+	size_t component_len;	/* component length*/
+	size_t resid = *path_len;	/* Room left in the the path buffer */
+	size_t ntwrk_resid;
+	
+	while (network && resid && max_ntwrk_len) {
+		DBG_ASSERT(resid > 0);	/* Should never fail */
+		/* Find the next delimiter in the network string */
+		if (usingUnicode) {
+			delimiter = smb_utf16_strlchr((const uint16_t *)network, 
+										 htoles((uint16_t)ntwrk_delimiter), 
+										 max_ntwrk_len);
+			/* Remove the delimiter so we can get the component */
+			if (delimiter) {
+				max_ntwrk_len -= 2; /* consume the delimiter */
+				*((uint16_t *)delimiter) = 0;
+			}			/* Get the size of this component */
+			component_len = smb_utf16_strnsize((const uint16_t *)network, max_ntwrk_len);
+
+		} else {
+			delimiter = smb_strlchr((const uint8_t *)network, ntwrk_delimiter, max_ntwrk_len);
+			/* Remove the delimiter so we can get the component */
+			if (delimiter) {
+				max_ntwrk_len -= 1; /* consume the delimiter */
+				*((uint8_t *)delimiter) = 0;
+			}
+			/* Get the size of this component */
+			component_len = strnlen(network, max_ntwrk_len);
+		}
+		ntwrk_resid = component_len; /* Amount that we want them to consume */
+		error = smb_convert_from_network((const char **)&network, &ntwrk_resid, 
+										 &path, &resid, flags, usingUnicode);
+		if (error) {
+			SMBDEBUG("smb_convert_from_network = %d\n", error);
+			return error;
+		}
+		/* Put the network delimiter back and move the pointer pass it */
+		if (delimiter) {
+			if (usingUnicode) {
+				*((uint16_t *)delimiter) = htoles(ntwrk_delimiter);
+				delimiter++;
+			} else {
+				*((uint8_t *)delimiter) = ntwrk_delimiter;
+			}
+			delimiter++;
+		}
+		network = delimiter;
+		/* Remove the amount that was consumed by smb_convert_from_network */
+		max_ntwrk_len -= (component_len - ntwrk_resid);
+		/* If we have more to process then add a UNIX delimiter */
+		if (network) {
+			if (!resid)
+				return E2BIG;
+			resid -= 1;
+			*path++ = '/';	
+		}
+	}
+	*path_len -= resid;
+	DBG_ASSERT((ssize_t)(*path_len) >= 0);
+	return error;
 }
