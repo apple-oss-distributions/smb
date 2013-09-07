@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2001 Boris Popov
  * All rights reserved.
  *
- * Portions Copyright (C) 2001 - 2009 Apple Inc. All rights reserved.
+ * Portions Copyright (C) 2001 - 2013 Apple Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -44,6 +44,7 @@
 
 #include <sys/smb_apple.h>
 #include <netsmb/smb.h>
+#include <netsmb/smb_2.h>
 #include <netsmb/smb_conn.h>
 #include <netsmb/smb_rq.h>
 #include <netsmb/smb_subr.h>
@@ -100,6 +101,7 @@ static const struct {
 	{STATUS_HOST_UNREACHABLE,		EHOSTUNREACH},
 	{STATUS_ILL_FORMED_PASSWORD,	EAUTH},
 	{STATUS_INTEGER_OVERFLOW,		ERANGE},
+	{STATUS_FILE_CLOSED,			EBADF},
 	{STATUS_INVALID_HANDLE,			EBADF},
 	{STATUS_INVALID_PARAMETER,		EINVAL},
 	{STATUS_INVALID_PIPE_STATE,		EPIPE},
@@ -192,6 +194,7 @@ static const struct {
 	{STATUS_NO_SUCH_LOGON_SESSION,	SMB_ENETFSACCOUNTRESTRICTED},
 	{STATUS_USER_EXISTS,			SMB_ENETFSACCOUNTRESTRICTED},
 	{STATUS_NO_SUCH_USER,			SMB_ENETFSACCOUNTRESTRICTED},
+	{STATUS_USER_SESSION_DELETED,	SMB_ENETFSACCOUNTRESTRICTED},
 	{STATUS_FILE_INVALID,			EIO},
 	{STATUS_DFS_EXIT_PATH_FOUND,	ENOENT},
 	{STATUS_DEVICE_DATA_ERROR,		EIO},
@@ -242,14 +245,6 @@ void smb_hexdump(const char *func, const char *s, unsigned char *buf, size_t inl
     printf("\" \n");
 }
 #endif // SMB_DEBUG
-
-int
-smb_sigintr(vfs_context_t context)
-{
-	if (context && vfs_context_issignal(context, SMB_SIGMASK))
-		return (EINTR);
-	return (0);
-}
 
 char * 
 smb_strndup(const char * string, size_t maxlen)
@@ -655,7 +650,9 @@ smb_ntstatus_to_errno(uint32_t ntstatus)
              * the notify code that something has changed. Just skip printing
              * the warning since we know why this is being returned.
              */
-			if ((ntstatus == STATUS_SUCCESS) || (ntstatus == STATUS_NOTIFY_ENUM_DIR)) {
+			if ((ntstatus == STATUS_SUCCESS) || 
+                (ntstatus == STATUS_NOTIFY_ENUM_DIR) ||
+                (ntstatus == STATUS_NOTIFY_CLEANUP)) {
 				return 0;
 			}
 			SMBWARNING("STATUS_SEVERITY_SUCCESS ntstatus = 0x%x\n", ntstatus);

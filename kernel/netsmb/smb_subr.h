@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2001, Boris Popov
  * All rights reserved.
  *
- * Portions Copyright (C) 2001 - 2010 Apple Inc. All rights reserved.
+ * Portions Copyright (C) 2001 - 2013 Apple Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -140,6 +140,7 @@ typedef uint16_t	smb_unichar;
 typedef	smb_unichar	*smb_uniptr;
 
 struct mbchain;
+struct mdchain;
 struct smb_vc;
 struct smb_rq;
 
@@ -148,7 +149,6 @@ void smb_hexdump(const char *func, const char *s, unsigned char *buf, size_t inl
 #else // SMB_DEBUG
 #define smb_hexdump(a,b,c,d)
 #endif // SMB_DEBUG
-int  smb_sigintr(vfs_context_t);
 char *smb_strndup(const char *s, size_t maxlen);
 void *smb_memdup(const void *umem, int len);
 void *smb_memdupin(user_addr_t umem, int len);
@@ -168,4 +168,6 @@ int  smb_put_asunistring(struct smb_rq *rqp, const char *src);
 struct sockaddr *smb_dup_sockaddr(struct sockaddr *sa, int canwait);
 int  smb_rq_sign(struct smb_rq *rqp);
 int  smb_rq_verify(struct smb_rq *rqp);
+int  smb2_rq_sign(struct smb_rq *rqp);
+int  smb2_rq_verify(struct smb_rq *rqp, struct mdchain *mdp, uint8_t *signature);
 #endif /* !_NETSMB_SMB_SUBR_H_ */
